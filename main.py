@@ -87,6 +87,28 @@ class DelusionistFactory:
             return (os.path.join(self.base_dir, 'extracted_words.txt'), "Korean")
         return (os.path.join(self.base_dir, '100000word.txt'), "English")
 
+    # Mode definitions — pure verb-vs-non-verb coherence axis. No examples.
+    MODE_DEFINITIONS = {
+        "CHAOS": (
+            "CHAOS mode — verb-argument coherence constraint LIFTED. In each sentence, the verb "
+            "is not required to semantically agree with its arguments (subject and object); it "
+            "may, but it does not have to. Verb-argument incoherence is permitted but never "
+            "required. There are no additional constraints on non-verbal sentence components "
+            "either."
+        ),
+        "NUANCE": (
+            "NUANCE mode — verb-argument coherence required. In each sentence, the verb MUST "
+            "semantically agree with its arguments (subject and object): the action it names is "
+            "actually applicable to its subject and object. Incoherence in the verb-argument "
+            "binding is forbidden. Any incoherence, if present, must lie only among non-verbal "
+            "sentence components (modifiers, settings, co-occurring entities). Sentences in "
+            "which all components fully cohere are also acceptable."
+        ),
+    }
+
+    def _describe_mode(self, mode: str) -> str:
+        return self.MODE_DEFINITIONS.get(mode.strip().upper(), self.MODE_DEFINITIONS["NUANCE"])
+
     def _build_step1_gemini_prompt(
         self,
         direction: str,
@@ -96,6 +118,7 @@ class DelusionistFactory:
         language_rule: str,
         batch_start: int,
         batch_random_words: list[list[str]],
+        mode: str = "NUANCE",
     ) -> str:
         # Keep prompt compact but strict about output formatting for easy parsing.
         lines = []
@@ -108,6 +131,9 @@ class DelusionistFactory:
         lines.append("- End each sentence with a parenthetical annotation: what collision emerged, what direction it could go. e.g., (충돌: 빙하+요리 → 느린 해동 조리법 가능성)")
         lines.append("- No titles, no explanations, no extra blank lines.")
         lines.append("")
+        lines.append("MODE:")
+        lines.append(f"- {self._describe_mode(mode)}")
+        lines.append("")
         lines.append("CONSTRAINTS:")
         if mandatory:
             lines.append(f"- Every line MUST include ALL mandatory words exactly as written: {', '.join(mandatory)}")
@@ -115,7 +141,7 @@ class DelusionistFactory:
             lines.append(f"- LANGUAGE_RULE: {language_rule}")
         if imagery:
             lines.append(f"- Prefer imagery motifs: {', '.join(imagery)}")
-        lines.append("- The sentences should feel like a surreal collision (bold, unexpected connections), but still read naturally.")
+        lines.append("- The sentences should feel like a surreal collision (bold, unexpected connections); naturalness is governed by the MODE rule above.")
         lines.append("- Random words are for context pollution: you may replace them with context-fitting variants if needed, but keep the 'collision' spirit.")
         lines.append("")
         lines.append("CONTEXT:")
@@ -150,6 +176,7 @@ class DelusionistFactory:
         mandatory = req.get("MANDATORY_WORD", [])
         imagery = req.get("PREFERRED_IMAGERY", [])
         language_rule = req.get("LANGUAGE_RULE", "NO_3_CONSECUTIVE_FOREIGN_WORDS")
+        mode = req.get("MODE_SELECTION", "NUANCE")
 
         chains_done = self.count_lines(self.section_a_path)
         remaining = max(0, int(chains_target) - int(chains_done))
@@ -174,6 +201,7 @@ class DelusionistFactory:
             language_rule=language_rule,
             batch_start=batch_start,
             batch_random_words=batch_random_words,
+            mode=mode,
         )
 
         prompt_path = os.path.join(self.staging_dir, "step1_gemini_prompt.txt")
@@ -257,13 +285,6 @@ class DelusionistFactory:
                 words.append(stripped)
         
         return words
-
-    def get_mode_ratio(self, mode):
-        """모드별 Python 랜덤 vs AI 선택 비율"""
-        if mode == "CHAOS":
-            return {"python_random": 0.7, "ai_semantic": 0.3}
-        else:  # NUANCE
-            return {"python_random": 0.3, "ai_semantic": 0.7}
 
     def _analyze_vocab_level(self, direction):
         """
@@ -419,6 +440,7 @@ class DelusionistFactory:
         mandatory = req.get("MANDATORY_WORD", [])
         imagery = req.get("PREFERRED_IMAGERY", [])
         language_rule = req.get("LANGUAGE_RULE", "NO_3_CONSECUTIVE_FOREIGN_WORDS")
+        mode = req.get("MODE_SELECTION", "NUANCE")
         model = os.getenv("DELUSIONIST_GEMINI_MODEL", self.DEFAULT_GEMINI_MODEL).strip()
 
         # chains_done 기준으로 전역 줄 번호 계산
@@ -441,6 +463,7 @@ class DelusionistFactory:
                 language_rule=language_rule,
                 batch_start=batch_start,
                 batch_random_words=random_words,
+                mode=mode,
             )
 
             prompt_path = os.path.join(
@@ -501,12 +524,12 @@ class DelusionistFactory:
 
         # word_pool = self.load_word_pool() # REMOVED: Memory inefficiency
         state = self.load_state()
-        ratio = self.get_mode_ratio(mode)
-        
+        mode_definition = self._describe_mode(mode)
+
         logging.info(f"[CONFIG] Mode: {mode} | Chains: {chains_target}")
         logging.info(f"[CONFIG] Selection B: {selection_b_count} | Final Output: {refining_count}")
         logging.info(f"[CONFIG] Detected Language: {detected_lang} -> Pool: {os.path.basename(self.word_pool_path)}")
-        logging.info(f"[CONFIG] Ratio: Python {ratio['python_random']*100:.0f}% / AI {ratio['ai_semantic']*100:.0f}%")
+        logging.info(f"[CONFIG] Mode definition: {mode_definition}")
         
         # ========== STEP 1: Chaining CoT ==========
         if state["current_step"] == 1:
@@ -550,43 +573,47 @@ class DelusionistFactory:
                 print("="*70)
                 print("  ")
                 print("  ## 💡 Core Concept: Stochastic Context Pollution")
-                print("  - LLM은 스스로를 놀라게 할 수 없습니다. 외부 무작위성이 확률 곡선을 깹니다.")
-                print("  - 깨끗한 맥락은 진부한 결과를 낳고, 오염된 맥락은 창의적 연결을 강제합니다.")
+                print("  - An LLM cannot surprise itself. External randomness breaks its probability curve.")
+                print("  - A clean context yields cliché; a polluted context forces unexpected connections.")
                 print("  ")
                 print("  ## 📋 Configuration & Context")
-                print(f"  - 🎯 DIRECTION (방향성): \"{direction}\"")
+                print(f"  - 🎯 DIRECTION: \"{direction}\"")
                 print(f"  - 🌱 STARTING_SENTENCE: \"{starting}\"")
                 print(f"  - 🔑 MANDATORY_WORD: {', '.join(mandatory)}")
                 print(f"  - 🎨 PREFERRED_IMAGERY: {', '.join(imagery)}")
-                print(f"  - ⚙️ MODE: {mode} (Python Randomness Ratio: {ratio['python_random']*100:.0f}%)")
+                print(f"  - ⚙️ MODE: {mode}")
+                print(f"       └ {mode_definition}")
                 print("  ")
                 print("  ## 🎲 Random Word Injection (Context Pollution)")
-                print(f"  이번 배치에서 사용할 무작위 단어들 ({current_batch}줄분):")
+                print(f"  Random words for this batch ({current_batch} lines):")
                 print("  " + "-"*66)
                 for idx, words in enumerate(batch_random_words, start=batch_start):
                     print(f"     [{idx:03d}] {', '.join(words)}")
                 print("  " + "-"*66)
                 print("  ")
-                print("  ## 🚀 Agent Action Required (구체적 지시사항)")
+                print("  ## 🚀 Agent Action Required")
                 print("  ")
-                print(f"  1. 위 'DIRECTION'을 깊이 분석하십시오. 이 방향성이 우리가 도달해야 할 도착점입니다.")
-                print(f"  2. 'STARTING_SENTENCE'와 위 '무작위 단어'를 충돌시켜, 논리를 파괴하는 '망상적 문장'을 만드십시오.")
-                print(f"  3. ⚠️ 과감성 필수: 안전하고 말이 되는 문장은 실패입니다. 기괴하고, 충격적이고, 초현실적인 연결을 시도하십시오.")
-                print(f"  4. [권한] '창의적 발산'이 더 필요하다면 `update_request_config`로 CHAINS_COUNT를 과감히 늘리십시오 (예: 50, 100, 200, 300).")
-                print(f"  5. [필수] '{', '.join(mandatory)}' 포함 & {language_rule} 준수.")
-                print(f"  6. [CONTEXT RULE] 문맥의 자연스러움이 최우선입니다. 무작위 단어가 뜬금없는 단어라면, 이를 그대로 쓰지 말고 문맥에 맞게 치환하십시오.")
-                print(f"  7. 의학, 공학, 화학, 언어학, 예술등 분야의 난해한 전문용어는 문맥에 맞을때만 사용. 아니면 대체")
+                print(f"  1. Read DIRECTION carefully. It is the destination every line aims at.")
+                print(f"  2. Collide STARTING_SENTENCE with the random words above to produce 'delusional sentences' — bold, unexpected combinations.")
+                print(f"  3. [MODE — applies to every line] {mode_definition}")
+                print(f"     → CHAOS: the verb is NOT required to agree semantically with its subject/object. Both coherence and incoherence are allowed; neither is forced.")
+                print(f"     → NUANCE: the verb MUST agree with its subject/object. Incoherence, if present, is allowed only among non-verbal components (modifiers, settings, co-occurring entities). Fully coherent sentences also pass.")
+                print(f"  4. [Authority] If you need more variation, raise CHAINS_COUNT aggressively via `update_request_config` (e.g., 50, 100, 200, 300).")
+                print(f"  5. [Mandatory] Include '{', '.join(mandatory)}' in every line. Obey {language_rule}.")
+                print(f"  6. [CONTEXT RULE] Naturalness of context comes first. If a random word feels alien, don't keep it verbatim — swap it for a context-fitting variant.")
+                print(f"  7. Esoteric jargon (medicine, engineering, chemistry, linguistics, art, etc.) is allowed ONLY when it actually fits the context. Otherwise, replace with a plain term.")
                 print("  ")
-                print(f"  8. [출력 형식] 각 문장 앞에 번호를 붙이십시오 (예: 001, 002...).")
-                print(f"     → 위 Random Word Injection 목록에서 문장 번호와 동일한 번호의 무작위 단어 3개를 해당 문장에 1:1 대응시키십시오. (예: [001]의 3단어 → 001번 문장에서 사용, [002]의 3단어 → 002번 문장에서 사용. 문장 간 단어 겹침 없음)")
-                print(f"     → 사용한 무작위 단어(또는 도메인에 맞게 변형한 단어)를 문장 내에서 markdown 볼드(**단어**)로 표시하십시오. 볼드 최소 3개.")
-                print(f"     → 예: [001]에 빙하, 항해, 균열이 배정된 경우 → 001. 식감의 **균열** 속에서 **항해**하듯 한 접시의 조합이 **빙하**처럼 녹아내린다. (충돌: 빙하+요리 → 느린 해동 조리법 가능성)")
-                print(f"  9. [주석 필수] 각 문장 끝에 괄호로 짧은 주석을 추가하십시오.")
-                print(f"     → 이 문장에서 어떤 충돌이 발생했는지, 어떤 방향으로 발전 가능한지를 한 줄로 메모.")
-                print(f"     → 다음 단계에서 이 주석을 선택적으로 참고하여 아이디어를 확장합니다.")
+                print(f"  8. [Output format] Prefix each sentence with a 3-digit number (001, 002, ...).")
+                print(f"     → For each line, use the 3 random words assigned to its line number 1:1. ([001]'s 3 words → line 001 only; [002]'s 3 words → line 002 only; no overlap across lines.)")
+                print(f"     → Wrap each used random word (or its domain-adapted variant) in markdown bold (**word**). At least 3 bolded words per line.")
+                print(f"     → Example: [001] = glacier, voyage, crack →")
+                print(f"        001. The **crack** in texture lets a single plate **voyage** through itself, melting like a slow **glacier**. (Collision: glacier + cooking → slow-thaw cooking technique)")
+                print(f"  9. [Annotation required] At the end of each sentence, in parentheses, write a one-line note:")
+                print(f"     → What collision happened in this line, and which direction it could grow toward.")
+                print(f"     → Step 2 may optionally use this note to expand the idea.")
                 print("  ")
-                print(f"  👉 생성 목표: DIRECTION(\"{direction[:30]}...\")을 향해 폭주하는 {current_batch}개의 파격적인 문장")
-                print(f"  👉 행동: 결과물을 `{self.section_a_path}` 파일에 정확히 append 하십시오.")
+                print(f"  👉 Goal: {current_batch} bold, unexpected sentences aimed at DIRECTION (\"{direction[:30]}...\").")
+                print(f"  👉 Action: append the result to `{self.section_a_path}` exactly.")
                 print("  ")
                 print("="*70 + "\n")
                 return
@@ -617,46 +644,64 @@ class DelusionistFactory:
                 print(f"  [STEP 2: REFINING CoT] - Selection B #{batch_start}~{batch_end} / {selection_b_count}")
                 print("="*70)
                 print("  ")
-                print("  ## 💡 Core Concept: Collision Naming — 충돌에 나만의 이름 붙이기")
-                print("  - Step 1의 혼돈에서 '기존에 함께 쓰이지 않던 관념·아이디어의 조합'을 찾아내십시오.")
-                print("  - 이미 알려진 관념·아이디어의 재서술은 탈락. 새로운 충돌만 남기십시오.")
-                print("  - 비유적 표현은 허용하되, 그 비유가 가리키는 새로운 조합의 실체가 있어야 합니다.")
+                print("  ## 💡 Core Concept: Collision → Concrete Mechanism (preserve depth, strip abstraction)")
+                print("  - Preserve the 'depth' the Step 1 collisions produced — the tension, the gap, the accumulated weight of meaning across two domains.")
+                print("  - Strip the 'abstractness' from the result — vague generalizations and ungraspable phrasing must go.")
+                print("  - Good refinement: the result lands on something concrete you can hold, yet the depth of the collision is still preserved in it.")
+                print("  - Bad refinement 1: it escapes into abstract phrases like 'the essence of X' or 'the aesthetics of Y' and the depth evaporates.")
+                print("  - Bad refinement 2: the depth gets flattened into a one-liner — \"basically, an idea about X.\"")
                 print("  ")
                 print("  ## 📋 Refinement Context")
                 print(f"  - 🎯 DIRECTION: \"{direction}\"")
                 print(f"  - 🖼 PREFERRED_IMAGERY: {', '.join(imagery)}")
                 print(f"  - 🔍 Source File: {self.section_a_path} (STEP 1 Output)")
                 print("  ")
-                print("  ## 🚀 Agent Action Required (구체적 지시사항)")
+                print("  ## 🚀 Agent Action Required")
                 print("  ")
-                print(f"  0. [이전 단계 주석 참고] STEP 1 문장 끝의 괄호 주석은 선택적으로 참고하십시오. 새로운 발상의 실마리가 될 수 있습니다.")
-                print(f"  1. [충돌 식별] STEP 1의 문장에서 '기존에 함께 쓰이지 않던 관념·아이디어의 조합'을 찾으십시오.")
-                print(f"     → 이미 존재하는 관념·아이디어를 단순히 다시 설명한 것은 탈락.")
-                print(f"     → 최소 2개 이상의 영역이 교차하는 조합만 선별하십시오.")
-                print(f"  2. [고유 명명] 찾아낸 충돌에 나만의 이름을 붙이십시오.")
-                print(f"     → 이미 알려진 관념·아이디어의 이름을 그대로 쓰면 감점.")
-                print(f"     → 이름은 짧고 직관적이되, 기존 어디에도 없는 조합이어야 합니다.")
-                print(f"  3. [실체 부여] 이름 붙인 충돌이 실제로 무엇인지 구체적으로 서술하되,")
-                print(f"     → 기존의 단일 관념·아이디어 하나로 환원 가능하면 안 됩니다.")
-                print(f"     → '행위(동사)' 또는 '사건(상황)'이 하나 이상 포함되어야 합니다.")
-                print(f"  4. [검증] 베테랑이 읽었을 때 '이건 못 본 건데, 말이 되네'가 기준입니다.")
-                print(f"     → '아, 이거 알아'면 탈락. '이건 새로운데 납득이 된다'여야 통과.")
-                print(f"  4-1. [탈락 기준] 이 아이디어가 무작위 단어 주입 없이도 도메인 전문가가 10분 안에 떠올릴 수 있는가?")
-                print(f"     → 그렇다면 탈락. Stochastic Context Pollution의 존재 이유는 전문가의 사고 반경 바깥을 치는 것이다.")
-                print(f"  5. [있어 보이기 감지] 아래 패턴이 보이면 즉시 삭제하거나 구체적 내용으로 교체하십시오:")
-                print(f"     → 고유명사 나열 (예: 'A의 사상, B의 미학' 식의 장식적 열거)")
-                print(f"     → 실체 없는 메타포 연쇄 (비유가 비유를 설명하고, 그 비유를 또 비유로 설명하는 구조)")
-                print(f"     → 과도한 미사여구 ('~의 ~의 ~' 관형어가 3단 이상 중첩되는 문장)")
-                print(f"  6. 필수 단어({', '.join(mandatory)})가 문맥에 자연스럽게 녹아들었는지 확인하십시오.")
-                print(f"  7. [CONTEXT RULE] 무작위 단어가 뜬금없으면 그대로 쓰지 말고 문맥에 맞게 치환하십시오.")
-                print(f"  8. [JARGON BAN] 난해한 전문용어는 문맥에 맞을 때만 사용. 아니면 일상어로 대체.")
-                print(f"  9. [주석 필수] 각 정제 문장 끝에 괄호로 짧은 주석을 추가하십시오:")
-                print(f"     → 뭐가 인상적이었는지, C단계에서 어떤 소재/구조로 활용 가능한지, 어떤 방향으로 확장할 수 있는지를 1~2문장으로 메모.")
-                print(f"     → 예: \"(이 충돌은 C단계에서 활동 설계의 '축소 실행' 옵션으로 쓸 수 있다. 면역학 비유가 날카롭다)\"")
-                print(f"  10. '{current_batch}개'의 정제된 문장을 완성하십시오.")
+                print(f"  0. [Use Step 1 annotations] The parenthetical notes at the end of Step 1 lines are optional but useful — treat them as hints for new angles.")
+                print(f"  1. [Identify collisions] Find combinations of ideas/notions in Step 1 that have not been put together before.")
+                print(f"     → Mere restatement of an existing idea is rejected.")
+                print(f"     → Only keep crossings of two or more distinct domains.")
+                print(f"  2. [Process Step 1 material — combine and edit] Do not copy collisions verbatim.")
+                print(f"     → If a Step 1 line had real potential but the model didn't use it well, edit it directly.")
+                print(f"     → If two or more ideas only become complete when fused, fuse them. If anything is still missing afterward, edit further.")
+                print(f"     → Goal of processing: preserve depth, strip abstraction (see #4).")
+                print(f"  3. [PRUNING — do NOT pre-expand candidates n-fold]")
+                print(f"     → Pre-expanding the candidate pool to several times the target only to cut it down is a waste. Don't do it.")
+                print(f"     → Self-censorship rule: \"ingenious but not absurd\".")
+                print(f"     → Append only what survives in this batch. If you're on the fence about keeping one — drop it. Being on the fence already means it failed self-censorship once.")
+                print(f"     → If this batch comes up short, end short. The next batch picks up the slack naturally.")
+                print(f"  4. [Preserve depth, strip abstraction]")
+                print(f"     → Depth: the tension, gap, and accumulated meaning the collision produced → keep.")
+                print(f"     → Abstractness: vague generalizations, ungraspable phrasing → remove.")
+                print(f"     → The result lands on something concrete, yet the depth of the collision that got you there is still embedded in it.")
+                print(f"     → Reductions to \"basically, an idea about X\" or escapes into \"the essence of\" / \"the aesthetics of\" are rejected.")
+                print(f"  5. [Naming — original + grounded by default. Retreat only when truly impossible.]")
+                print(f"     → Name the collision and its mechanism. Attempt naming actively.")
+                print(f"     → Conditions for a good name:")
+                print(f"        ❌ Self-referential / arbitrary — a name that points only to its inspiration source, telling the reader nothing about its mechanism or domain.")
+                print(f"        ✅ Original + grounded — a fresh compound that still works inside the existing vocabulary system. The name itself should reveal \"principle + key qualifier.\" If a clean acronym fits, attach it.")
+                print(f"     → Only when no good name actually emerges, fall back to a plain functional descriptor (\"this recipe\", \"this structure\", \"this pattern\"). Retreat-as-an-excuse is forbidden.")
+                print(f"  6. [Make it real] Describe what the (named or plainly-referred) collision actually is, in concrete terms.")
+                print(f"     → If it reduces to a single existing notion, it's rejected.")
+                print(f"     → It must contain at least one action (verb) or event (situation).")
+                print(f"  7. [Validation] The bar is a veteran reader saying \"haven't seen this — but it makes sense.\"")
+                print(f"     → \"Oh, I know that\" → fail. \"This is new and yet it tracks\" → pass.")
+                print(f"  7-1. [Disqualifier] Could a domain expert come up with this idea in 10 minutes without random-word injection?")
+                print(f"     → If yes, reject. The whole point of Stochastic Context Pollution is to land outside the expert's reach.")
+                print(f"  8. [PPB detector] If you see any of these, delete or replace with concrete content:")
+                print(f"     → Name-dropping (e.g., decorative lists like 'the thought of A, the aesthetics of B').")
+                print(f"     → Substanceless metaphor chains (a metaphor explaining a metaphor explaining a metaphor).")
+                print(f"     → Excessive flourish (three-deep nested possessives like 'the X of the Y of the Z').")
+                print(f"  9. Verify that the mandatory words ({', '.join(mandatory)}) sit naturally in the context.")
+                print(f"  10. [CONTEXT RULE] If a random word feels alien, don't keep it verbatim — swap for a context-fitting variant.")
+                print(f"  11. [JARGON BAN] Esoteric jargon only when it fits. Otherwise, plain language.")
+                print(f"  12. [Annotation required] End each refined line with a one-line parenthetical note:")
+                print(f"     → What was striking, what material/structure it could become in Step 3, what direction it could expand.")
+                print(f"     → e.g.: \"(works in Step 3 as a 'reduced execution' option for activity design; the immunology analogy is sharp.)\"")
                 print("  ")
-                print(f"  👉 생성 목표: DIRECTION에 부합하면서도, 기존에 없던 관념·아이디어의 조합인 {current_batch}개의 문장")
-                print(f"  👉 행동: 결과물을 `{self.section_b_path}` 파일에 정확히 append 하십시오.")
+                print(f"  👉 Goal: {selection_b_count} entries final. This batch tries {current_batch}, but no forced filling — only what survives.")
+                print(f"  👉 Action: append the result to `{self.section_b_path}` exactly.")
                 print("  ")
                 print("="*70 + "\n")
                 return
@@ -683,50 +728,56 @@ class DelusionistFactory:
                 print(f"  [STEP 3: FINAL CoT] - {final_done} lines appended / {refining_count} entries target")
                 print("="*70)
                 print("  ")
-                print("  ## 💡 Core Concept: Objectification — DIRECTION 작성자의 언어로 객관화")
-                print("  - Step 2의 재료를 융합하되, '자신만의 표현'은 거의 제거하십시오.")
-                print("  - 최종 결과물은 DIRECTION을 쓴 사람의 어휘 수준·톤·전문성에 맞춰야 합니다.")
+                print("  ## 💡 Core Concept: Objectification — speak in the DIRECTION author's voice")
+                print("  - Fuse the Step 2 material, but strip out almost all of your own characteristic phrasing.")
+                print("  - The final result must match the vocabulary, tone, and expertise level of whoever wrote DIRECTION.")
                 print("  ")
                 print("  ## 📋 Final Context")
                 print(f"  - 🎯 DIRECTION: \"{direction}\"")
                 print(f"  - 🗣 FINAL_LANGUAGE: {final_language}")
                 print(f"  - 📊 Analysis: {vocab_hint}")
                 print("  ")
-                print("  ## 🚀 Agent Action Required (구체적 지시사항)")
+                print("  ## 🚀 Agent Action Required")
                 print("  ")
-                print(f"  0. [이전 단계 주석 참고] STEP 2 문장 끝의 괄호 주석은 선택적으로 참고하십시오. 어떤 소재/구조로 활용할지 힌트가 담겨 있습니다.")
-                print(f"  1. STEP 2의 결과물({self.section_b_path})을 바탕으로, 최종 결과물을 구성하십시오.")
-                print(f"  2. [언어 수준 매칭] DIRECTION의 어투·어휘·전문성 수준을 분석하고, 그 수준에 맞춰 작성하십시오.")
-                print(f"     → DIRECTION이 전문적이면 전문 용어 유지 (MCP를 돌리는 AI가 유저에게 설명 가능하므로).")
-                print(f"     → DIRECTION이 일상적이면 쉬운 표현으로 전환.")
-                print(f"  3. [자기 표현 제한] 각 최종 결과물에서 '자신만의 독창적 표현'은 제목 1개 + 핵심 키워드 1개가 한계입니다.")
-                print(f"     → 나머지는 전부 DIRECTION과 STEP 2 재료에서의 표현을 유추 가능한 표현으로 구성하십시오.")
-                print(f"     → 독자가 읽었을 때 '이건 내가 쓴 direction에서 나온 말이구나'라고 느껴야 합니다.")
-                print(f"  4. [객관화 원칙] 주관적 감탄이나 미사여구를 배제하십시오.")
-                print(f"     → '~의 미학이다', '~의 언어다' 같은 추상적 정의문은 금지. 대신 '~하면 ~가 된다'는 조건-결과 구조로 서술.")
-                print(f"     → 모든 단락은 '뭘 하라는 건지' 한 줄로 요약 가능해야 합니다.")
-                print(f"  5. [있어 보이기 최종 점검] 아래 해당하면 삭제 또는 교체:")
-                print(f"     → 고유명사·사조 나열 (구체적이고 자가 검증 가능한 과학적으로 엄밀한 설명 없이 이름만 나열하는 경우)")
-                print(f"     → 구체적 행위·사건·이해관계가 없는 설정")
-                print(f"     → 과도한 미사여구, 비유가 비유를 낳는 순환 구조")
-                print(f"  6. [가용성] 결과물은 DIRECTION 작성자가 바로 활용할 수 있는 형태여야 합니다. 해석이 필요한 암호가 아니라, 읽으면 바로 행동으로 옮길 수 있는 수준.")
-                print(f"  7. [작동 검증] 각 아이디어가 실제로 작동하는지 최소 1개의 구체적 예시/시나리오로 시뮬레이션하십시오.")
-                print(f"     → 요리라면 조리 과정을 단계별로 걸어보고, 문학이라면 해당 구조로 짧은 시연 단락을 써보고, 비즈니스라면 고객 시나리오를 돌려보십시오.")
-                print(f"     → 시뮬레이션에서 논리가 깨지거나 물리적/구조적으로 불가능한 부분이 발견되면, 아이디어를 수정하거나 교체하십시오.")
-                print(f"     → 시뮬레이션 결과 자체도 최종 결과물에 포함하여 독자가 작동 원리를 볼 수 있게 하십시오.")
-                print(f"  8. [기대치 초과] DIRECTION 내의 [기대치 정의] 블록을 읽고, 그 천장을 넘어서십시오.")
-                print(f"     → '이 정도면 됐다'가 아니라 '이건 예상 못 했다'가 반응이어야 합니다.")
-                print(f"     → 기대치가 전문가 수준이면 전문가가 동료에게 공유할 밀도를, 5세 기준이면 5세가 소리 지르며 좋아할 것을 만드십시오.")
-                print(f"  9. [수직적 깊이] DIRECTION이 설정한 프레임 안에서만 파십시오. 밖으로 나가지 않습니다.")
-                print(f"     → 요청이 'RP 캐릭터 시트'면 RP 캐릭터 시트의 최고봉을 만드십시오 — 갑자기 소설이나 논문을 쓰지 마십시오.")
-                print(f"     → 요청이 '5세 기준'이면 20대 기준을 섞지 마십시오. 해당 프레임 내부의 밀도와 정교함으로 승부하십시오.")
-                print(f"  10. {refining_count}개의 최종 결과물을 생성하십시오.")
+                print(f"  0. [Use Step 2 annotations] The parenthetical notes at the end of Step 2 lines are optional hints for which material/structure to lean on.")
+                print(f"  0-1. [Pick the Main Idea — required before writing] Read the full Step 2 output and pick exactly ONE idea to be the root of the final piece.")
+                print(f"     → This Main Idea must take up at least 30% of the final piece's volume and depth.")
+                print(f"     → Criterion: the rest of the ideas should fold into or extend from this Main Idea.")
+                print(f"     → Don't pick the 'flashiest' one — pick the one most directly tied to DIRECTION and with the highest extension potential.")
+                print(f"     → Once picked, place the Main Idea explicitly in the first paragraph (or right after the title), and let everything that follows revolve around it.")
+                print(f"  1. Build the final piece from the Step 2 output ({self.section_b_path}).")
+                print(f"  2. [Match the language level] Analyze DIRECTION's tone, vocabulary, and expertise level, and write to that level.")
+                print(f"     → If DIRECTION is technical, keep the technical terms (the AI running the MCP can explain them to the user).")
+                print(f"     → If DIRECTION is everyday, switch to plain language.")
+                print(f"  3. [Limit your own voice] In each final piece, your 'own original phrasing' is capped at 1 title + 1 key term.")
+                print(f"     → [Restraint on naming] Even that 1 only earns a name if BOTH conditions hold: (a) the concept is essentially one-of-a-kind in the real world, AND (b) compressing it into a single word produces semantic/economic gain across two or more later references. Otherwise, use a plain phrase (\"this method\", \"this structure\").")
+                print(f"     → If a plain phrase already lets the DIRECTION author go \"oh, that's just the X way,\" prefer that.")
+                print(f"     → The reader should feel \"this came out of the direction I wrote.\"")
+                print(f"  4. [Objectification rule] Cut subjective gushing and flourish.")
+                print(f"     → Ban abstract definition-statements like \"this is the aesthetics of X\" or \"this is the language of Y.\" Use a condition-result structure instead: \"if you do X, Y happens.\"")
+                print(f"     → Every paragraph must summarize in one line as \"what does this tell me to do?\"")
+                print(f"  5. [Final PPB sweep] Delete or replace any of:")
+                print(f"     → Name-dropping of authorities/movements without a concrete, self-verifiable, scientifically tight explanation.")
+                print(f"     → Setups with no concrete action, event, or stake.")
+                print(f"     → Excessive flourish; metaphor cycles where one metaphor explains another.")
+                print(f"  6. [Usability] The result must be ready for the DIRECTION author to use immediately. Not a cipher to decode — readable and directly actionable.")
+                print(f"  7. [Operational test] For each idea, run at least one concrete example/scenario to confirm it actually works.")
+                print(f"     → For cooking, walk the recipe step by step. For literature, write a short demo paragraph using that structure. For business, run a customer scenario.")
+                print(f"     → If the simulation breaks logically, physically, or structurally, fix or replace the idea.")
+                print(f"     → Include the simulation result itself in the final piece so the reader can see how the mechanism actually works.")
+                print(f"  8. [Beat the expectations] Read the [expectations] block inside DIRECTION and break through that ceiling.")
+                print(f"     → The reaction you're aiming for is \"didn't see this coming,\" not \"this is fine.\"")
+                print(f"     → If the bar is expert-level, reach a density an expert would actually share with a colleague. If the bar is age-5, make something a 5-year-old would scream with joy over.")
+                print(f"  9. [Vertical depth] Dig only inside the frame DIRECTION sets. Do not wander outside it.")
+                print(f"     → If the request is 'an RP character sheet,' make the best RP character sheet in the world — don't suddenly pivot to a novel or a paper.")
+                print(f"     → If the request is 'age-5,' don't smuggle in age-20 material. Compete on density and precision inside the frame, not by changing frames.")
+                print(f"  10. Produce {refining_count} final piece(s).")
                 print("  ")
-                print(f"  👉 생성 목표: DIRECTION을 달성하는, 완결성 있는 {refining_count}개의 Masterpiece")
-                print(f"  👉 행동: 결과물을 `{self.section_c_path}` 파일에 정확히 append 하십시오.")
-                print(f"  👉 완료 신호: 모든 결과물을 append한 뒤, 마지막 append_result 호출 시 finalize=true를 전달하십시오.")
-                print(f"     → finalize=true가 전달되어야만 Step 3이 완료 처리됩니다.")
-                print(f"     → 여러 번 나눠서 append해도 됩니다. 마지막 한 번만 finalize=true이면 됩니다.")
+                print(f"  👉 Goal: {refining_count} self-contained pieces that fulfill DIRECTION.")
+                print(f"  👉 Action: append the result to `{self.section_c_path}` exactly.")
+                print(f"  👉 Completion signal: after all pieces are appended, on the final append_result call, pass finalize=true.")
+                print(f"     → Step 3 only completes when finalize=true is sent.")
+                print(f"     → You may split the append into multiple calls. Only the very last call needs finalize=true.")
                 print("  ")
                 print("="*70 + "\n")
                 return

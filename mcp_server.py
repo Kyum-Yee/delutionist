@@ -427,6 +427,86 @@ Operator(메인 에이전트)가 반환된 cmd를 run_command로 직접 병렬 �
                 },
                 "required": []
             }
+        ),
+        Tool(
+            name="prepare_mini_step1_workers",
+            description="""[Mini] Prepare workers for Step 1 (chaining). Supports both Gemini CLI and orchestrator-direct (SELF) execution.
+
+Mini variant runs Step 1 → Step 1-1 only (no Step 2/3, no queue.json). Splits the target chain count into N workers and writes a prompt per worker to mini/staging/.
+
+Two execution modes (controlled by `executor`):
+- "GEMINI" (default): returns a gemini CLI cmd per worker. Operator runs cmds in parallel, then calls parse_mini_step1_response on each stdout.
+- "SELF": orchestrator generates chains directly from the prompt text. Each worker returns its prompt; no cmd. Orchestrator produces line_count lines per worker following the prompt's strict 3-digit-numbered format.
+
+Returns: {executor, final_language, total_workers, total_lines, workers: [{worker_id, line_count, prompt_path, prompt, cmd?}]}.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "chains_count": {"type": "integer", "description": "Total chains to generate this run."},
+                    "chains_per_worker": {"type": "integer", "default": 25, "description": "Chains per worker. Also caps each call's output size."},
+                    "direction": {"type": "string", "description": "DIRECTION."},
+                    "starting": {"type": "string", "default": "", "description": "STARTING_SENTENCE."},
+                    "mandatory": {"type": "array", "items": {"type": "string"}, "default": [], "description": "MANDATORY_WORD list."},
+                    "imagery": {"type": "array", "items": {"type": "string"}, "default": [], "description": "PREFERRED_IMAGERY list."},
+                    "mode": {"type": "string", "enum": ["CHAOS", "NUANCE"], "default": "NUANCE"},
+                    "final_language": {"type": "string", "default": "Auto", "description": "'Korean' | 'English' | 'Auto' (detect from text)."},
+                    "executor": {"type": "string", "enum": ["GEMINI", "SELF"], "default": "GEMINI"},
+                    "model": {"type": "string", "default": "", "description": "Gemini model id (used only when executor=GEMINI)."}
+                },
+                "required": ["chains_count", "direction"]
+            }
+        ),
+        Tool(
+            name="prepare_mini_step1_1_workers",
+            description="""[Mini] Prepare workers for Step 1-1 (PPB discard ~1/5 + idea conversion of survivors).
+
+Takes the chain lines from Step 1, splits into N workers, and writes a prompt per worker that instructs:
+1) discard about one fifth as PPB, 2) convert each survivor into a single-line idea.
+
+Same two execution modes as prepare_mini_step1_workers:
+- "GEMINI" (default): returns gemini cmd per worker. Parse with parse_mini_step1_1_response.
+- "SELF": orchestrator generates ideas directly from the prompt text.
+
+Returns: {executor, final_language, total_workers, total_kept_lines, workers: [{worker_id, line_count, prompt_path, prompt, cmd?}]}.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "chains": {"type": "array", "items": {"type": "string"}, "description": "Chain lines from Step 1 (after parse_mini_step1_response)."},
+                    "chains_per_worker": {"type": "integer", "default": 25},
+                    "direction": {"type": "string"},
+                    "mandatory": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "final_language": {"type": "string", "default": "Auto"},
+                    "executor": {"type": "string", "enum": ["GEMINI", "SELF"], "default": "GEMINI"},
+                    "model": {"type": "string", "default": ""}
+                },
+                "required": ["chains", "direction"]
+            }
+        ),
+        Tool(
+            name="parse_mini_step1_response",
+            description="""[Mini] Parse a Gemini CLI raw response (or any text containing numbered chain lines) and return only lines that start with a 3-digit number.
+
+Useful for the GEMINI executor. Safe to also call on SELF outputs to strip noise.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "raw": {"type": "string", "description": "Raw stdout from `gemini --output-format json ...`, or plain numbered text."}
+                },
+                "required": ["raw"]
+            }
+        ),
+        Tool(
+            name="parse_mini_step1_1_response",
+            description="""[Mini] Parse a Gemini CLI raw response (or any one-line-per-idea text) into an idea list.
+
+Strips leading bullets/numbering, surrounding quotes/backticks, and markdown bold (**...**).""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "raw": {"type": "string"}
+                },
+                "required": ["raw"]
+            }
         )
     ]
 
@@ -710,6 +790,181 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             "workers": workers,
         }
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+    elif name == "prepare_mini_step1_workers":
+        try:
+            from mini.core import DelutionistConfig, split_step1_workers, detect_language
+        except ImportError as e:
+            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
+
+        chains_count = int(arguments.get("chains_count", 0))
+        if chains_count < 1:
+            return [TextContent(type="text", text="ERROR: chains_count must be >= 1")]
+
+        direction = str(arguments.get("direction", "")).strip()
+        if not direction:
+            return [TextContent(type="text", text="ERROR: direction is required")]
+
+        starting = str(arguments.get("starting", ""))
+        mandatory = list(arguments.get("mandatory") or [])
+        imagery = list(arguments.get("imagery") or [])
+        mode = str(arguments.get("mode", "NUANCE")).upper()
+        final_language_in = str(arguments.get("final_language", "Auto"))
+        executor = str(arguments.get("executor", "GEMINI")).upper()
+        if executor not in ("GEMINI", "SELF"):
+            executor = "GEMINI"
+        model = str(arguments.get("model", ""))
+        chains_per_worker = max(1, int(arguments.get("chains_per_worker", 25)))
+
+        fl_norm = final_language_in.strip().upper()
+        if fl_norm == "KOREAN":
+            final_language = "Korean"
+        elif fl_norm == "ENGLISH":
+            final_language = "English"
+        else:
+            final_language = detect_language(starting + direction)
+
+        cfg = DelutionistConfig(
+            direction=direction,
+            starting=starting,
+            mandatory=mandatory,
+            imagery=imagery,
+            mode=mode,
+            final_language=final_language,
+        )
+
+        from pathlib import Path
+        mini_staging = Path(factory.base_dir) / "mini" / "staging"
+        try:
+            workers = split_step1_workers(
+                cfg=cfg,
+                total_chains=chains_count,
+                chains_per_worker=chains_per_worker,
+                staging_dir=mini_staging,
+                model=model,
+            )
+        except Exception as e:
+            return [TextContent(type="text", text=f"ERROR: split_step1_workers failed: {e}")]
+
+        workers_out = []
+        for w in workers:
+            try:
+                prompt_text = w.prompt_path.read_text(encoding="utf-8")
+            except Exception:
+                prompt_text = ""
+            item = {
+                "worker_id": w.worker_id,
+                "line_count": w.line_count,
+                "prompt_path": str(w.prompt_path),
+                "prompt": prompt_text,
+            }
+            if executor == "GEMINI":
+                item["cmd"] = w.cmd
+            workers_out.append(item)
+
+        result = {
+            "executor": executor,
+            "final_language": final_language,
+            "total_workers": len(workers),
+            "total_lines": sum(w.line_count for w in workers),
+            "workers": workers_out,
+        }
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+    elif name == "prepare_mini_step1_1_workers":
+        try:
+            from mini.core import DelutionistConfig, split_step1_1_workers, detect_language
+        except ImportError as e:
+            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
+
+        chains = list(arguments.get("chains") or [])
+        if not chains:
+            return [TextContent(type="text", text="ERROR: chains must be a non-empty list")]
+
+        direction = str(arguments.get("direction", "")).strip()
+        if not direction:
+            return [TextContent(type="text", text="ERROR: direction is required")]
+
+        mandatory = list(arguments.get("mandatory") or [])
+        final_language_in = str(arguments.get("final_language", "Auto"))
+        executor = str(arguments.get("executor", "GEMINI")).upper()
+        if executor not in ("GEMINI", "SELF"):
+            executor = "GEMINI"
+        model = str(arguments.get("model", ""))
+        chains_per_worker = max(1, int(arguments.get("chains_per_worker", 25)))
+
+        fl_norm = final_language_in.strip().upper()
+        if fl_norm == "KOREAN":
+            final_language = "Korean"
+        elif fl_norm == "ENGLISH":
+            final_language = "English"
+        else:
+            final_language = detect_language(direction + " ".join(chains[:5]))
+
+        cfg = DelutionistConfig(
+            direction=direction,
+            starting="",
+            mandatory=mandatory,
+            imagery=[],
+            mode="NUANCE",
+            final_language=final_language,
+        )
+
+        from pathlib import Path
+        mini_staging = Path(factory.base_dir) / "mini" / "staging"
+        try:
+            workers = split_step1_1_workers(
+                cfg=cfg,
+                chains=chains,
+                chains_per_worker=chains_per_worker,
+                staging_dir=mini_staging,
+                model=model,
+            )
+        except Exception as e:
+            return [TextContent(type="text", text=f"ERROR: split_step1_1_workers failed: {e}")]
+
+        workers_out = []
+        for w in workers:
+            try:
+                prompt_text = w.prompt_path.read_text(encoding="utf-8")
+            except Exception:
+                prompt_text = ""
+            item = {
+                "worker_id": w.worker_id,
+                "line_count": w.line_count,
+                "prompt_path": str(w.prompt_path),
+                "prompt": prompt_text,
+            }
+            if executor == "GEMINI":
+                item["cmd"] = w.cmd
+            workers_out.append(item)
+
+        result = {
+            "executor": executor,
+            "final_language": final_language,
+            "total_workers": len(workers),
+            "total_kept_lines": sum(w.line_count for w in workers),
+            "workers": workers_out,
+        }
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+    elif name == "parse_mini_step1_response":
+        try:
+            from mini.core import parse_step1_response
+        except ImportError as e:
+            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
+        raw = str(arguments.get("raw", ""))
+        lines = parse_step1_response(raw)
+        return [TextContent(type="text", text=json.dumps(lines, ensure_ascii=False))]
+
+    elif name == "parse_mini_step1_1_response":
+        try:
+            from mini.core import parse_step1_1_response
+        except ImportError as e:
+            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
+        raw = str(arguments.get("raw", ""))
+        lines = parse_step1_1_response(raw)
+        return [TextContent(type="text", text=json.dumps(lines, ensure_ascii=False))]
 
     else:
         return [TextContent(type="text", text=f"ERROR: Unknown tool '{name}'")]
