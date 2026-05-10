@@ -95,6 +95,37 @@ def _mini_staging_dir(agent_id: str) -> Path:
     return Path(BASE_DIR) / "mini" / "staging" / "agents" / agent_id
 
 
+def _read_skill(skill_dir_name: str) -> list[TextContent]:
+    """Bundle a skill directory into a JSON payload the client can dump to disk."""
+    skill_dir = Path(BASE_DIR) / "skills" / skill_dir_name
+    if not skill_dir.exists() or not skill_dir.is_dir():
+        return [TextContent(
+            type="text",
+            text=f"ERROR: skill '{skill_dir_name}' not found at {skill_dir}",
+        )]
+    files: list[dict[str, str]] = []
+    for fp in sorted(skill_dir.rglob("*")):
+        if not fp.is_file():
+            continue
+        rel = fp.relative_to(skill_dir).as_posix()
+        try:
+            content = fp.read_text(encoding="utf-8")
+            files.append({"path": rel, "content": content})
+        except Exception as e:
+            files.append({"path": rel, "error": str(e)})
+    payload = {
+        "skill_name": skill_dir_name,
+        "base_path": f"~/.claude/skills/{skill_dir_name}",
+        "files": files,
+        "instruction": (
+            f"Save each file at <base_path>/<path> (i.e. ~/.claude/skills/{skill_dir_name}/<path>). "
+            "Create the directory first if it does not exist (mkdir -p). "
+            "After saving, restart Claude Code (or reload skills) to make it visible."
+        ),
+    }
+    return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+
+
 # ── Step instructions builder (per-agent) ─────────────────────────────────
 
 def get_step_instructions(step: int, factory_instance: DelusionistFactory) -> str:
@@ -496,6 +527,32 @@ agent's mini/staging/. Same GEMINI / SELF executor split.""",
                 "required": ["raw"]
             }
         ),
+
+        # ── Skill download (no agent needed) ─────────────────────────
+        Tool(
+            name="get_skill_delutionist",
+            description="""[Skill download] Returns the bundled `delusionist` Claude Code skill — a full SKILL.md plus
+any auxiliary files — packaged as JSON the client can dump straight to `~/.claude/skills/delusionist/`.
+
+Response shape:
+{
+  "skill_name": "delusionist",
+  "base_path": "~/.claude/skills/delusionist",
+  "files": [{"path": "SKILL.md", "content": "..."}, ...],
+  "instruction": "Save each file at <base_path>/<path>; mkdir -p; restart to take effect."
+}
+
+Note: the directory name on disk stays `delusionist` (not `delutionist`) for backwards
+compat with existing references inside the skill.""",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+            name="get_skill_delutionist_mini",
+            description="""[Skill download] Returns the bundled `delusionist-mini` Claude Code skill.
+
+Same response shape as get_skill_delutionist. Save under `~/.claude/skills/delusionist-mini/`.""",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
     ]
 
 
@@ -551,6 +608,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             type="text",
             text=json.dumps(parse_step1_1_response(str(arguments.get("raw", ""))), ensure_ascii=False),
         )]
+
+    elif name == "get_skill_delutionist":
+        return _read_skill("delusionist")
+
+    elif name == "get_skill_delutionist_mini":
+        return _read_skill("delusionist-mini")
 
     # ── All remaining tools require a valid agent_id ──────────────────
     factory, err = _resolve_agent(arguments)
