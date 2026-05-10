@@ -34,19 +34,32 @@ class DelusionistFactory:
     # Avoid hardcoding a specific model to prevent churn; let `gemini` CLI pick its default.
     DEFAULT_GEMINI_MODEL = ""
 
-    def __init__(self):
+    def __init__(self, agent_id: str = ""):
+        """Workspace layout:
+          - agent_id != "":  input|output|staging are scoped to <agent_id>/
+          - agent_id == "":  legacy single-tenant layout (local-only fallback;
+                             the MCP backend always passes an id)
+        """
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.input_dir = os.path.join(self.base_dir, 'input')
-        self.output_dir = os.path.join(self.base_dir, 'output')
-        self.staging_dir = os.path.join(self.base_dir, 'staging')
-        
+        self.agent_id = agent_id
+
+        if agent_id:
+            self.input_dir = os.path.join(self.base_dir, 'input', 'agents', agent_id)
+            self.output_dir = os.path.join(self.base_dir, 'output', 'agents', agent_id)
+            self.staging_dir = os.path.join(self.base_dir, 'staging', 'agents', agent_id)
+        else:
+            self.input_dir = os.path.join(self.base_dir, 'input')
+            self.output_dir = os.path.join(self.base_dir, 'output')
+            self.staging_dir = os.path.join(self.base_dir, 'staging')
+
+        os.makedirs(self.input_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.staging_dir, exist_ok=True)
-        
+
         self.request_path = os.path.join(self.input_dir, 'request.json')
         self.word_pool_path = None  # Will be set dynamically in run() based on request.json
         self.state_path = os.path.join(self.staging_dir, 'state.json')
-        
+
         # Output files for each step
         self.section_a_path = os.path.join(self.output_dir, 'section_a_chains.txt')
         self.section_b_path = os.path.join(self.output_dir, 'section_b_refined.txt')
@@ -795,5 +808,6 @@ class DelusionistFactory:
 
 
 if __name__ == "__main__":
-    factory = DelusionistFactory()
+    agent_id = os.environ.get("DELUSIONIST_AGENT_ID", "").strip()
+    factory = DelusionistFactory(agent_id=agent_id)
     factory.run()

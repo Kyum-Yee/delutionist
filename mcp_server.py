@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 """
-Delusionist Factory MCP Server (Antigravity Optimized)
+Delusionist Factory MCP Server (multi-agent isolated workspaces).
 
-MCP (Model Context Protocol) server wrapping Delusionist Factory
-for seamless integration with Antigravity AI agent.
+Each agent must call register_agent() to obtain an `agent_id`, then pass that
+id to every subsequent tool call. The server keeps each agent's workspace
+fully isolated:
+
+    output/agents/<id>/         (section_a/b/c)
+    staging/agents/<id>/        (state.json, locks, prompts)
+    input/agents/<id>/          (request.json)
+    mini/staging/agents/<id>/   (mini Step 1 / 1-1 worker prompts)
+
+Sliding 24h TTL — every successful tool call extends the agent's expiry.
+Expired agents are swept lazily on each register_agent call.
 """
 
 import os
+import sys
 import json
 import random
 import asyncio
+from pathlib import Path
 from typing import Any
 
-# MCP SDK imports
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# Delusionist Factory class import
 from main import DelusionistFactory, FileLock
+from agents import AgentRegistry
 
 
-# Initialize MCP server
+# ── Initialization ────────────────────────────────────────────────────────
+
 server = Server("delusionist-factory")
-
-# Factory instance
-factory = DelusionistFactory()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+registry = AgentRegistry(Path(BASE_DIR))
 
 # Word pool line counts (pre-calculated constants)
 WORD_POOL_LINE_COUNTS = {
@@ -35,52 +45,66 @@ WORD_POOL_LINE_COUNTS = {
 
 
 def get_word_pool_path(factory_instance: DelusionistFactory, is_korean: bool) -> str:
-    """Get word pool file path based on language."""
     if is_korean:
         return os.path.join(factory_instance.base_dir, 'extracted_words.txt')
-    else:
-        return os.path.join(factory_instance.base_dir, '100000word.txt')
+    return os.path.join(factory_instance.base_dir, '100000word.txt')
 
 
 def get_line_count(filepath: str) -> int:
-    """Get total line count of a file (uses pre-calculated constants)."""
-    filename = os.path.basename(filepath)
-    return WORD_POOL_LINE_COUNTS.get(filename, 10000)  # Default fallback
+    return WORD_POOL_LINE_COUNTS.get(os.path.basename(filepath), 10000)
 
 
 def get_random_words_from_file(filepath: str, count: int = 3) -> list[str]:
-    """
-    Get random words by picking random line numbers first,
-    then reading only those lines using linecache (cached after first read).
-    """
+    """Random word sampling via linecache (no full-file load)."""
     import linecache
-    
     total_lines = get_line_count(filepath)
     if total_lines == 0:
         return []
-    
-    # Pick random line numbers (1-indexed for linecache)
     target_lines = random.sample(range(1, total_lines + 1), min(count, total_lines))
-    
-    # Read only the target lines using linecache (caches file after first read)
-    words = []
+    words: list[str] = []
     for line_num in target_lines:
         line = linecache.getline(filepath, line_num)
         stripped = line.strip()
         if stripped:
             words.append(stripped)
-    
     return words
 
 
+# ── Agent helpers ─────────────────────────────────────────────────────────
+
+def _resolve_agent(arguments: dict[str, Any]):
+    """Validate agent_id, slide its expiry, return a scoped factory.
+
+    Returns (factory, None) on success, (None, error_response) on failure.
+    """
+    aid = str(arguments.get("agent_id") or "").strip()
+    if not aid:
+        return None, [TextContent(
+            type="text",
+            text="ERROR: 'agent_id' is required. Call register_agent first to obtain one."
+        )]
+    if not registry.touch(aid):
+        return None, [TextContent(
+            type="text",
+            text=f"ERROR: agent_id '{aid}' is unknown or expired. Call register_agent again."
+        )]
+    return DelusionistFactory(agent_id=aid), None
+
+
+def _mini_staging_dir(agent_id: str) -> Path:
+    return Path(BASE_DIR) / "mini" / "staging" / "agents" / agent_id
+
+
+# ── Step instructions builder (per-agent) ─────────────────────────────────
+
 def get_step_instructions(step: int, factory_instance: DelusionistFactory) -> str:
-    """Generate step-specific instructions without stdout capture."""
+    """Generate the next-step task block for the agent's factory."""
     req = factory_instance.load_request()
     if not req:
-        return "ERROR: request.json not found!"
-    
+        return "ERROR: request.json not found! Use update_request_config to seed one."
+
     state = factory_instance.load_state()
-    
+
     starting = req.get("STARTING_SENTENCE", "")
     mandatory = req.get("MANDATORY_WORD", [])
     imagery = req.get("PREFERRED_IMAGERY", [])
@@ -92,39 +116,30 @@ def get_step_instructions(step: int, factory_instance: DelusionistFactory) -> st
     step1_executor = (req.get("STEP1_EXECUTOR") or "GEMINI_CLI").strip().upper()
     if step1_executor not in ("GEMINI_CLI", "SELF"):
         step1_executor = "GEMINI_CLI"
-    
-    # Determine if Korean
-    content_to_check = starting + direction
+
     import re
-    is_korean = bool(re.search("[가-힣]", content_to_check))
-    
-    # Get word pool path
+    is_korean = bool(re.search("[가-힣]", starting + direction))
     word_pool_path = get_word_pool_path(factory_instance, is_korean)
-    
-    # Step 1: Chaining (external or self)
+
     if step == 1:
         chains_done = factory_instance.count_lines(factory_instance.section_a_path)
-        
         if chains_done >= chains_target:
-            # Advance to Step 2
             state["current_step"] = 2
             factory_instance.save_state(state)
             return f"STEP 1 COMPLETE ({chains_done} chains). Advancing to Step 2. Call run_delusionist again."
 
         if step1_executor == "GEMINI_CLI":
-            # Create a ready-to-run Gemini prompt file for this batch.
             try:
                 step1_batch_size = req.get("STEP1_BATCH_SIZE", 30)
                 info = factory_instance.prepare_step1_gemini_prompt(batch_size=step1_batch_size)
             except Exception as e:
                 return f"STEP 1 is external (Gemini CLI), but prompt preparation failed: {e}"
-
             return f"""
 === STEP 1: EXTERNAL (Gemini CLI) ===
 Progress: {chains_done}/{chains_target}
 
 NOTE:
-- MCP/Agent deliberately SKIPS generating Step 1 (A-stage).
+- MCP/Agent deliberately SKIPS generating Step 1.
 - Run Gemini CLI locally, then append the resulting lines to:
   {factory_instance.section_a_path}
 
@@ -141,7 +156,6 @@ Command:
 After you append enough lines, call run_delusionist again and it will advance to Step 2.
 """
 
-        # SELF: Provide agent instructions with random words similar to the original design.
         BATCH_SIZE = req.get("STEP1_BATCH_SIZE", 30)
         remaining = chains_target - chains_done
         current_batch = min(BATCH_SIZE, remaining)
@@ -172,27 +186,23 @@ RANDOM WORDS FOR THIS BATCH:
 {random_words_section}
 
 YOUR TASK:
-1. Generate {current_batch} \"delusional variant sentences\" using the random words above
-2. MUST include mandatory words ({', '.join(mandatory)}) in EVERY sentence
-3. LANGUAGE RULE: No 3+ consecutive foreign words when mixing Korean/English
-4. Call append_result with step=\"1\" and your generated sentences
+1. Generate {current_batch} delusional variant sentences using the random words above.
+2. MUST include mandatory words ({', '.join(mandatory)}) in EVERY sentence.
+3. LANGUAGE RULE: no 3+ consecutive foreign words when mixing Korean/English.
+4. Call append_result with step="1" and your generated sentences.
 
 After appending, call run_delusionist again to continue.
 """
-    
-    # Step 2: Refining
+
     elif step == 2:
         refined_done = factory_instance.count_lines(factory_instance.section_b_path)
-        
         if refined_done >= selection_b_count:
             state["current_step"] = 3
             factory_instance.save_state(state)
             return f"STEP 2 COMPLETE ({refined_done} refined). Advancing to Step 3. Call run_delusionist again."
-        
         BATCH_SIZE = 10
         remaining = selection_b_count - refined_done
         current_batch = min(BATCH_SIZE, remaining)
-        
         return f"""
 === STEP 2: REFINING CoT ===
 Progress: {refined_done}/{selection_b_count}
@@ -201,22 +211,20 @@ CONFIG:
 - Direction: {direction[:100]}...
 - Preferred Imagery: {', '.join(imagery)}
 
-YOUR TASK:
-1. Read section_a_chains.txt (use read_output_file with step="1")
-2. Analyze all chains and extract key words/phrases matching DIRECTION and IMAGERY
-3. Apply INGENUOUS filter: Select only ingenuous and innovative expressions
-4. Generate {current_batch} "refined delusional sentences" including mandatory words
-5. Each refined sentence MUST end with a parenthetical annotation: what was impressive, how it can be used as material/structure in C-stage, possible expansion directions (1-2 sentences)
-6. Call append_result with step="2" and your generated sentences
+YOUR TASK (v3 rules):
+1. Read section_a_chains.txt (read_output_file with step="1").
+2. Apply: depth-preserve / strip-abstraction, PRUNING ("ingenious but not absurd"),
+   naming as default (original + grounded; retreat to plain phrasing only when truly impossible).
+3. Generate {current_batch} refined entries; if fewer survive your self-censor, end short — the
+   next batch picks up the slack. Each entry MUST end with a parenthetical annotation.
+4. Call append_result with step="2".
 
-After appending, call run_delusionist again to continue.
+After appending, call run_delusionist again.
 """
-    
-    # Step 3: Final
+
     elif step == 3:
         final_done = factory_instance.count_lines(factory_instance.section_c_path)
         step3_finalized = state.get("step3_finalized", False)
-
         if step3_finalized:
             return f"""
 === ALL STEPS COMPLETE ===
@@ -226,252 +234,240 @@ Section C (Final): {os.path.basename(factory_instance.section_c_path)}
 
 Use read_output_file with step="3" to view final results.
 """
-
         return f"""
 === STEP 3: FINAL CoT ===
 Progress: {final_done} lines appended (target: {refining_count} entries, not finalized)
 
 YOUR TASK:
-1. Read section_b_refined.txt (use read_output_file with step="2")
-2. Read the [기대치 정의] block in DIRECTION — exceed that ceiling. "This is fine" is failure; "I didn't expect this" is the target.
-3. Stay VERTICALLY within the frame DIRECTION sets. Do not escape to adjacent domains. Go deeper, not wider.
-4. Expand meanings to create appropriate-level final strategies/outputs ({refining_count} items)
-5. Call append_result with step="3" and your generated outputs
-6. On your LAST append, pass finalize=true to mark Step 3 as complete.
-   → Step 3 does NOT auto-complete by line count. You must explicitly finalize.
-   → You can append in multiple batches. Only the last one needs finalize=true.
+1. Read section_b_refined.txt (read_output_file with step="2").
+2. Pick ONE Main Idea (>=30% of the final piece's volume/depth) before writing.
+3. Restraint on naming: only name if (a) one-of-a-kind in reality AND (b) compressing into a single
+   word produces semantic/economic gain across two or more later references. Otherwise plain phrase.
+4. Beat the [expectations] block; stay vertically inside DIRECTION's frame.
+5. Produce {refining_count} final piece(s).
+6. Call append_result with step="3"; on the LAST append, pass finalize=true.
 
 After finalizing, call run_delusionist to confirm completion.
 """
-    
+
     return "ERROR: Invalid step number"
 
 
+# ── Tool list ─────────────────────────────────────────────────────────────
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """Return list of available tools."""
     return [
+        # ── Agent lifecycle ───────────────────────────────────────────
         Tool(
-            name="get_request_guide",
-            description="""[CALL THIS FIRST] Get the full REQUEST_GUIDE.md — the complete operations manual for Delusionist Factory.
+            name="register_agent",
+            description="""[CALL THIS FIRST] Register a new agent and obtain an `agent_id`.
 
-IMPORTANT: Call this tool BEFORE calling run_delusionist or update_request_config for the first time in a session.
-It explains the 3-step pipeline, all request.json fields, DIRECTION framework, creative design principles, and anti-patterns.
-Without reading this guide, you will misconfigure the factory and produce poor results.""",
+The server issues a fresh id (e.g. 'a-3f2k7d9c') and creates an isolated workspace
+(output/, staging/, input/, mini/staging/) scoped to this id. Pass the returned id as
+'agent_id' to every subsequent tool call.
+
+Sliding 24h TTL: every successful tool call extends the expiry. Expired agents are
+swept lazily on each register_agent call. When done, call release_agent for prompt
+cleanup.""",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "ttl_hours": {"type": "integer", "default": 24, "description": "Sliding TTL window (hours, default 24)."}
+                },
                 "required": []
             }
         ),
         Tool(
-            name="run_delusionist",
-            description="""Execute Delusionist Factory - Creative delusional sentence generation pipeline.
-
-Checks current state and returns Agent task instructions for the next Step:
-- Step 1: (SKIPPED) External via Gemini CLI. MCP will provide the prompt/command only.
-- Step 2: Refining CoT (Extract refined sentences)
-- Step 3: Final CoT (Generate final outputs)
-
-Follow the returned instructions, generate sentences, then call append_result.""",
+            name="release_agent",
+            description="Immediately delete the agent's workspace and remove it from the registry. Idempotent.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "config_update": {
-                        "type": "object",
-                        "description": "Optional configuration update to apply specifically for this run (merges with request.json)",
-                    }
+                    "agent_id": {"type": "string", "description": "Agent id obtained from register_agent."}
                 },
-                "required": []
+                "required": ["agent_id"]
+            }
+        ),
+        Tool(
+            name="list_agents",
+            description="List all currently registered agents and their TTL metadata. Read-only / debug.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+
+        # ── Reference doc (no agent needed) ──────────────────────────
+        Tool(
+            name="get_request_guide",
+            description="""[CALL THIS EARLY] Get the full REQUEST_GUIDE.md — the operations manual for
+Delusionist Factory. Explains the 3-step pipeline, all request.json fields, the DIRECTION 6-Layer
+framework, anti-patterns, and the multi-agent isolation model. Read this before issuing tool calls
+for the first time in a session.""",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+
+        # ── Pipeline tools (require agent_id) ────────────────────────
+        Tool(
+            name="run_delusionist",
+            description="""Execute Delusionist Factory for the given agent. Returns the next-step task instructions.
+
+- Step 1: external Gemini CLI prompt + cmd (when STEP1_EXECUTOR=GEMINI_CLI), or in-agent task block (SELF).
+- Step 2: Refining CoT — depth preserve / strip abstraction.
+- Step 3: Final CoT — pick a Main Idea, beat the expectation ceiling, finalize when done.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "config_update": {"type": "object", "description": "Optional config update merged into this agent's request.json."}
+                },
+                "required": ["agent_id"]
             }
         ),
         Tool(
             name="get_status",
-            description="Get current Delusionist Factory progress status including step, counts, and mode.",
+            description="Get the agent's current pipeline progress (current_step, per-step counts, finalized flag).",
             inputSchema={
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {"agent_id": {"type": "string"}},
+                "required": ["agent_id"]
             }
         ),
         Tool(
             name="append_result",
-            description="""Append generated sentences to the output file for the specified step.
+            description="""Append generated sentences to the agent's output file for the given step.
 
 Arguments:
-- step: Step number as STRING ("1", "2", or "3")
-- content: Sentences to append (newline separated)
-- finalize: (Step 3 only) Set to true on the LAST append to signal completion. Step 3 will NOT auto-complete by line count — it waits for this explicit signal.""",
+- agent_id
+- step: '1' | '2' | '3'
+- content: newline-separated sentences
+- finalize: (Step 3 only) true on the LAST append to mark Step 3 complete.""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "step": {
-                        "type": "string",
-                        "description": "Step number: '1' for section_a, '2' for section_b, '3' for section_c",
-                        "enum": ["1", "2", "3"]
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Sentences to append (newline separated)"
-                    },
-                    "finalize": {
-                        "type": "boolean",
-                        "description": "Step 3 only: set true on the last append to mark Step 3 as complete",
-                        "default": False
-                    }
+                    "agent_id": {"type": "string"},
+                    "step": {"type": "string", "enum": ["1", "2", "3"]},
+                    "content": {"type": "string"},
+                    "finalize": {"type": "boolean", "default": False}
                 },
-                "required": ["step", "content"]
+                "required": ["agent_id", "step", "content"]
             }
         ),
         Tool(
             name="get_request_config",
-            description="Get current request.json configuration settings.",
+            description="Get the agent's current request.json configuration.",
             inputSchema={
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {"agent_id": {"type": "string"}},
+                "required": ["agent_id"]
             }
         ),
         Tool(
             name="update_request_config",
-            description="""Update request.json configuration.
+            description="""Update the agent's request.json configuration (merges into existing).
 
-Arguments:
-- config: Configuration object to update (full or partial)""",
+Numeric bounds applied: CHAINS_COUNT [1,700], SELECTION_B_COUNT [1,200], REFINING_COUNT [1,200],
+STEP1_BATCH_SIZE [1,100].""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "config": {
-                        "type": "object",
-                        "description": "Configuration object to update"
-                    }
+                    "agent_id": {"type": "string"},
+                    "config": {"type": "object", "description": "Configuration object to merge."}
                 },
-                "required": ["config"]
+                "required": ["agent_id", "config"]
             }
         ),
         Tool(
             name="reset_factory",
-            description="Reset Delusionist Factory to initial state (clears output/ and staging/ folders).",
+            description="Wipe the agent's output/ and staging/ files (keeps request.json). Requires confirm=true.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "confirm": {
-                        "type": "boolean",
-                        "description": "Confirmation flag (must be true to execute)"
-                    }
+                    "agent_id": {"type": "string"},
+                    "confirm": {"type": "boolean"}
                 },
-                "required": ["confirm"]
+                "required": ["agent_id", "confirm"]
             }
         ),
         Tool(
             name="get_random_words",
-            description="""Get random words from the word pool (uses Python random.sample).
-
-Arguments:
-- count: Number of words to extract (default: 3)""",
+            description="Sample N random words from the (language-appropriate) word pool for the agent.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "count": {
-                        "type": "integer",
-                        "description": "Number of words to extract",
-                        "default": 3
-                    }
+                    "agent_id": {"type": "string"},
+                    "count": {"type": "integer", "default": 3}
                 },
-                "required": []
+                "required": ["agent_id"]
             }
         ),
         Tool(
             name="read_output_file",
-            description="""Read contents of a specific step's output file.
-
-Arguments:
-- step: Step number as STRING ("1", "2", or "3")""",
+            description="Read the agent's section_a/b/c output file.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "step": {
-                        "type": "string",
-                        "description": "Step number: '1' for section_a, '2' for section_b, '3' for section_c",
-                        "enum": ["1", "2", "3"]
-                    }
+                    "agent_id": {"type": "string"},
+                    "step": {"type": "string", "enum": ["1", "2", "3"]}
                 },
-                "required": ["step"]
+                "required": ["agent_id", "step"]
             }
         ),
         Tool(
             name="prepare_parallel_gemini_workers",
-            description="""Step 1(Chaining) 병렬 Gemini CLI 워커 준비.
+            description="""Step 1 parallel Gemini CLI workers — split the remaining chains into N workers,
+write a prompt per worker to the agent's staging/, and return the gemini cmd per worker.
 
-남은 chains를 분할하고 각 워커용 프롬프트를 staging/worker_{id}_prompt.txt에 저장한다.
-Operator(메인 에이전트)가 반환된 cmd를 run_command로 직접 병렬 실행하고,
-응답을 append_result로 올리는 방식 — sub-agent 토큰이 0이 된다.
-
-반환: 워커별 {worker_id, line_count, prompt_path, cmd, batch_start, batch_end} 배열.
-
-두 가지 모드 (batch_size 우선):
-- batch_size: 워커당 줄 수 지정 → 워커 수 자동 계산
-- worker_count: 워커 수 직접 지정 → 줄을 균등 분할
-둘 다 미지정 시 batch_size=25 기본값.""",
+Two modes (batch_size takes precedence):
+- batch_size: chains per worker, worker_count auto-computed.
+- worker_count: number of workers, chains evenly distributed.
+Both unset -> batch_size=25 default.""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "worker_count": {
-                        "type": "integer",
-                        "description": "병렬 워커 수. batch_size와 동시 지정 시 batch_size 우선."
-                    },
-                    "batch_size": {
-                        "type": "integer",
-                        "description": "워커당 줄 수. 지정 시 워커 수를 자동 계산 (ceil(remaining / batch_size))."
-                    }
+                    "agent_id": {"type": "string"},
+                    "worker_count": {"type": "integer"},
+                    "batch_size": {"type": "integer"}
                 },
-                "required": []
+                "required": ["agent_id"]
             }
         ),
+
+        # ── Mini tools ───────────────────────────────────────────────
         Tool(
             name="prepare_mini_step1_workers",
-            description="""[Mini] Prepare workers for Step 1 (chaining). Supports both Gemini CLI and orchestrator-direct (SELF) execution.
-
-Mini variant runs Step 1 → Step 1-1 only (no Step 2/3, no queue.json). Splits the target chain count into N workers and writes a prompt per worker to mini/staging/.
+            description="""[Mini] Step 1 (chaining) workers, scoped to this agent's mini/staging/.
 
 Two execution modes (controlled by `executor`):
-- "GEMINI" (default): returns a gemini CLI cmd per worker. Operator runs cmds in parallel, then calls parse_mini_step1_response on each stdout.
-- "SELF": orchestrator generates chains directly from the prompt text. Each worker returns its prompt; no cmd. Orchestrator produces line_count lines per worker following the prompt's strict 3-digit-numbered format.
+- "GEMINI" (default): returns gemini CLI cmd per worker.
+- "SELF": orchestrator runs the prompt directly (cmd not returned, prompt body is).
 
-Returns: {executor, final_language, total_workers, total_lines, workers: [{worker_id, line_count, prompt_path, prompt, cmd?}]}.""",
+Returns: {agent_id, executor, final_language, total_workers, total_lines, workers: [{worker_id, line_count, prompt_path, prompt, cmd?}]}.""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "chains_count": {"type": "integer", "description": "Total chains to generate this run."},
-                    "chains_per_worker": {"type": "integer", "default": 25, "description": "Chains per worker. Also caps each call's output size."},
-                    "direction": {"type": "string", "description": "DIRECTION."},
-                    "starting": {"type": "string", "default": "", "description": "STARTING_SENTENCE."},
-                    "mandatory": {"type": "array", "items": {"type": "string"}, "default": [], "description": "MANDATORY_WORD list."},
-                    "imagery": {"type": "array", "items": {"type": "string"}, "default": [], "description": "PREFERRED_IMAGERY list."},
+                    "agent_id": {"type": "string"},
+                    "chains_count": {"type": "integer"},
+                    "chains_per_worker": {"type": "integer", "default": 25},
+                    "direction": {"type": "string"},
+                    "starting": {"type": "string", "default": ""},
+                    "mandatory": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "imagery": {"type": "array", "items": {"type": "string"}, "default": []},
                     "mode": {"type": "string", "enum": ["CHAOS", "NUANCE"], "default": "NUANCE"},
-                    "final_language": {"type": "string", "default": "Auto", "description": "'Korean' | 'English' | 'Auto' (detect from text)."},
+                    "final_language": {"type": "string", "default": "Auto"},
                     "executor": {"type": "string", "enum": ["GEMINI", "SELF"], "default": "GEMINI"},
-                    "model": {"type": "string", "default": "", "description": "Gemini model id (used only when executor=GEMINI)."}
+                    "model": {"type": "string", "default": ""}
                 },
-                "required": ["chains_count", "direction"]
+                "required": ["agent_id", "chains_count", "direction"]
             }
         ),
         Tool(
             name="prepare_mini_step1_1_workers",
-            description="""[Mini] Prepare workers for Step 1-1 (PPB discard ~1/5 + idea conversion of survivors).
-
-Takes the chain lines from Step 1, splits into N workers, and writes a prompt per worker that instructs:
-1) discard about one fifth as PPB, 2) convert each survivor into a single-line idea.
-
-Same two execution modes as prepare_mini_step1_workers:
-- "GEMINI" (default): returns gemini cmd per worker. Parse with parse_mini_step1_1_response.
-- "SELF": orchestrator generates ideas directly from the prompt text.
-
-Returns: {executor, final_language, total_workers, total_kept_lines, workers: [{worker_id, line_count, prompt_path, prompt, cmd?}]}.""",
+            description="""[Mini] Step 1-1 (PPB ~1/5 discard + idea conversion) workers, scoped to this
+agent's mini/staging/. Same GEMINI / SELF executor split.""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "chains": {"type": "array", "items": {"type": "string"}, "description": "Chain lines from Step 1 (after parse_mini_step1_response)."},
+                    "agent_id": {"type": "string"},
+                    "chains": {"type": "array", "items": {"type": "string"}},
                     "chains_per_worker": {"type": "integer", "default": 25},
                     "direction": {"type": "string"},
                     "mandatory": {"type": "array", "items": {"type": "string"}, "default": []},
@@ -479,63 +475,97 @@ Returns: {executor, final_language, total_workers, total_kept_lines, workers: [{
                     "executor": {"type": "string", "enum": ["GEMINI", "SELF"], "default": "GEMINI"},
                     "model": {"type": "string", "default": ""}
                 },
-                "required": ["chains", "direction"]
+                "required": ["agent_id", "chains", "direction"]
             }
         ),
         Tool(
             name="parse_mini_step1_response",
-            description="""[Mini] Parse a Gemini CLI raw response (or any text containing numbered chain lines) and return only lines that start with a 3-digit number.
-
-Useful for the GEMINI executor. Safe to also call on SELF outputs to strip noise.""",
+            description="[Mini] Parse a raw Gemini CLI response (or any numbered text) and return only lines starting with a 3-digit number. Stateless — no agent_id needed.",
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "raw": {"type": "string", "description": "Raw stdout from `gemini --output-format json ...`, or plain numbered text."}
-                },
+                "properties": {"raw": {"type": "string"}},
                 "required": ["raw"]
             }
         ),
         Tool(
             name="parse_mini_step1_1_response",
-            description="""[Mini] Parse a Gemini CLI raw response (or any one-line-per-idea text) into an idea list.
-
-Strips leading bullets/numbering, surrounding quotes/backticks, and markdown bold (**...**).""",
+            description="[Mini] Parse a raw Gemini CLI response (or any one-line-per-idea text) and return idea lines. Stateless.",
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "raw": {"type": "string"}
-                },
+                "properties": {"raw": {"type": "string"}},
                 "required": ["raw"]
             }
-        )
+        ),
     ]
 
 
+# ── Tool dispatch ─────────────────────────────────────────────────────────
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Execute tool."""
-    
+    # ── No-agent tools ────────────────────────────────────────────────
     if name == "get_request_guide":
-        guide_path = os.path.join(factory.base_dir, "REQUEST_GUIDE.md")
+        guide_path = os.path.join(BASE_DIR, "REQUEST_GUIDE.md")
         if not os.path.exists(guide_path):
             return [TextContent(type="text", text="ERROR: REQUEST_GUIDE.md not found")]
         with open(guide_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return [TextContent(type="text", text=content)]
+            return [TextContent(type="text", text=f.read())]
 
-    elif name == "run_delusionist":
+    elif name == "register_agent":
+        ttl = int(arguments.get("ttl_hours") or 24)
+        info = registry.register(ttl_hours=ttl)
+        return [TextContent(type="text", text=json.dumps(info, ensure_ascii=False, indent=2))]
+
+    elif name == "release_agent":
+        aid = str(arguments.get("agent_id", "")).strip()
+        if not aid:
+            return [TextContent(type="text", text="ERROR: agent_id is required")]
+        ok = registry.release(aid)
+        if ok:
+            return [TextContent(type="text", text=f"SUCCESS: agent_id '{aid}' released and workspace deleted.")]
+        return [TextContent(type="text", text=f"NOOP: agent_id '{aid}' was unknown or already released.")]
+
+    elif name == "list_agents":
+        agents = registry.list_all()
+        return [TextContent(type="text", text=json.dumps(
+            {"count": len(agents), "agents": agents},
+            ensure_ascii=False, indent=2,
+        ))]
+
+    elif name == "parse_mini_step1_response":
+        try:
+            from mini.core import parse_step1_response
+        except ImportError as e:
+            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
+        return [TextContent(
+            type="text",
+            text=json.dumps(parse_step1_response(str(arguments.get("raw", ""))), ensure_ascii=False),
+        )]
+
+    elif name == "parse_mini_step1_1_response":
+        try:
+            from mini.core import parse_step1_1_response
+        except ImportError as e:
+            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
+        return [TextContent(
+            type="text",
+            text=json.dumps(parse_step1_1_response(str(arguments.get("raw", ""))), ensure_ascii=False),
+        )]
+
+    # ── All remaining tools require a valid agent_id ──────────────────
+    factory, err = _resolve_agent(arguments)
+    if err is not None:
+        return err
+    aid = factory.agent_id
+
+    if name == "run_delusionist":
         config_update = arguments.get("config_update")
-        
-        # 1. Update request.json if config_update is provided
         if config_update:
             current = factory.load_request() or {}
             current.update(config_update)
             with open(factory.request_path, 'w', encoding='utf-8') as f:
                 json.dump(current, f, ensure_ascii=False, indent=2)
-                
-        # If we're at Step 1 and chains aren't done:
-        # - GEMINI_CLI: return external prompt/command (don't run main.py)
-        # - SELF: run main.py (prints instructions for the agent) as usual
+
         state = factory.load_state()
         step = state.get("current_step", 1)
         if step == 1:
@@ -544,40 +574,33 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             chains_target = req.get("CHAINS_COUNT", 120)
             chains_done = factory.count_lines(factory.section_a_path)
             if step1_executor == "GEMINI_CLI" and chains_done < chains_target:
-                text = get_step_instructions(1, factory)
-                return [TextContent(type="text", text=text)]
+                return [TextContent(type="text", text=get_step_instructions(1, factory))]
 
         import subprocess
-        import sys
-
-        # 2. Run main.py via subprocess to capture all output
         result = subprocess.run(
             [sys.executable, "main.py"],
             cwd=factory.base_dir,
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=60,
+            env={**os.environ, "DELUSIONIST_AGENT_ID": aid},
         )
-
         if result.returncode != 0:
-            print(f"[run_delusionist] stderr: {result.stderr}", file=sys.stderr)
+            print(f"[run_delusionist:{aid}] stderr: {result.stderr}", file=sys.stderr)
             return [TextContent(type="text", text=f"Error running pipeline (exit {result.returncode}). Check server logs.")]
-        output = result.stdout or "No output from main.py"
-        return [TextContent(type="text", text=output)]
-    
+        return [TextContent(type="text", text=result.stdout or "No output from main.py")]
+
     elif name == "get_status":
         state = factory.load_state()
         req = factory.load_request()
-
         if not req:
-            return [TextContent(type="text", text="ERROR: request.json not found")]
+            return [TextContent(type="text", text="ERROR: request.json not found. Use update_request_config first.")]
 
         chains_done = factory.count_lines(factory.section_a_path)
         refined_done = factory.count_lines(factory.section_b_path)
         final_done = factory.count_lines(factory.section_c_path)
         step3_finalized = state.get("step3_finalized", False)
 
-        # Step 3: show finalize status instead of misleading line-count ratio
         if step3_finalized:
             step3_display = f"finalized ({final_done} lines)"
         elif final_done > 0:
@@ -586,29 +609,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             step3_display = f"0/{req.get('REFINING_COUNT', 2)}"
 
         status = {
+            "agent_id": aid,
             "current_step": state.get("current_step", 1),
             "progress": {
                 "step1_chains": f"{chains_done}/{req.get('CHAINS_COUNT', 120)}",
                 "step2_refined": f"{refined_done}/{req.get('SELECTION_B_COUNT', 8)}",
-                "step3_final": step3_display
+                "step3_final": step3_display,
             },
             "mode": req.get("MODE_SELECTION", "CHAOS"),
-            "starting_sentence": req.get("STARTING_SENTENCE", "")
+            "starting_sentence": req.get("STARTING_SENTENCE", ""),
         }
-
         return [TextContent(type="text", text=json.dumps(status, ensure_ascii=False, indent=2))]
-    
-    elif name == "append_result":
-        step_str = arguments.get("step", "")
-        content = arguments.get("content", "")
-        finalize = arguments.get("finalize", False)
 
-        # Convert string step to int
+    elif name == "append_result":
+        step_str = str(arguments.get("step", ""))
+        content = str(arguments.get("content", ""))
+        finalize = bool(arguments.get("finalize", False))
         try:
             step = int(step_str)
         except (ValueError, TypeError):
-            return [TextContent(type="text", text=f"ERROR: Invalid step '{step_str}'. Must be '1', '2', or '3'")]
-
+            return [TextContent(type="text", text=f"ERROR: Invalid step '{step_str}'. Must be '1', '2', or '3'.")]
         if step == 1:
             filepath = factory.section_a_path
         elif step == 2:
@@ -616,31 +636,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif step == 3:
             filepath = factory.section_c_path
         else:
-            return [TextContent(type="text", text=f"ERROR: Invalid step {step}. Must be 1, 2, or 3")]
+            return [TextContent(type="text", text=f"ERROR: Invalid step {step}. Must be 1, 2, or 3.")]
 
-        # 파일 잠금으로 병렬 에이전트의 동시 쓰기 방지
         factory.locked_append(filepath, content)
-
         lines_added = len([l for l in content.strip().split('\n') if l.strip()])
-        msg = f"SUCCESS: Appended {lines_added} lines to {os.path.basename(filepath)}"
-
-        # Step 3 finalize: set flag in state.json so run_delusionist knows we're done
+        msg = f"SUCCESS: appended {lines_added} lines to {os.path.basename(filepath)} (agent {aid})"
         if finalize and step == 3:
             state = factory.load_state()
             state["step3_finalized"] = True
             factory.save_state(state)
             msg += " | FINALIZED: Step 3 marked as complete."
-
         return [TextContent(type="text", text=msg)]
-    
+
     elif name == "get_request_config":
         req = factory.load_request()
         if not req:
             return [TextContent(type="text", text="ERROR: request.json not found")]
         return [TextContent(type="text", text=json.dumps(req, ensure_ascii=False, indent=2))]
-    
+
     elif name == "update_request_config":
-        config = arguments.get("config", {})
+        config = arguments.get("config") or {}
         _NUMERIC_LIMITS = {
             "CHAINS_COUNT": (1, 700),
             "SELECTION_B_COUNT": (1, 200),
@@ -655,68 +670,44 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             current.update(config)
             with open(factory.request_path, 'w', encoding='utf-8') as f:
                 json.dump(current, f, ensure_ascii=False, indent=2)
+        return [TextContent(type="text", text=f"SUCCESS: updated request.json for agent {aid}")]
 
-        return [TextContent(type="text", text="SUCCESS: Updated request.json")]
-    
     elif name == "reset_factory":
         if not arguments.get("confirm", False):
             return [TextContent(type="text", text="ERROR: confirm must be true to reset")]
+        for d in (factory.output_dir, factory.staging_dir):
+            if os.path.exists(d):
+                for f in os.listdir(d):
+                    fp = os.path.join(d, f)
+                    if os.path.isfile(fp):
+                        os.remove(fp)
+        return [TextContent(type="text", text=f"SUCCESS: factory reset for agent {aid}")]
 
-        # Clear output
-        if os.path.exists(factory.output_dir):
-            for f in os.listdir(factory.output_dir):
-                filepath = os.path.join(factory.output_dir, f)
-                if os.path.isfile(filepath):
-                    os.remove(filepath)
-
-        # Clear staging (state, lock files, prompts)
-        if os.path.exists(factory.staging_dir):
-            for f in os.listdir(factory.staging_dir):
-                filepath = os.path.join(factory.staging_dir, f)
-                if os.path.isfile(filepath):
-                    os.remove(filepath)
-
-        return [TextContent(type="text", text="SUCCESS: Factory reset complete")]
-    
     elif name == "get_random_words":
         count = min(max(int(arguments.get("count", 3)), 1), 100)
-        
-        # Determine word pool based on request
         req = factory.load_request()
         if not req:
             return [TextContent(type="text", text="ERROR: request.json not found")]
-        
         starting = req.get("STARTING_SENTENCE", "")
         direction = req.get("DIRECTION", "")
-        content_to_check = starting + direction
-        
-        # Check language preference first
         final_lang = req.get("FINAL_LANGUAGE", "").strip().upper()
-        
         if final_lang == "KOREAN":
             is_korean = True
         elif final_lang == "ENGLISH":
             is_korean = False
         else:
-            # Fallback to auto-detection
             import re
-            is_korean = bool(re.search("[가-힣]", content_to_check))
-        
-        # Get random words using efficient file reading
+            is_korean = bool(re.search("[가-힣]", starting + direction))
         word_pool_path = get_word_pool_path(factory, is_korean)
         words = get_random_words_from_file(word_pool_path, count)
-        
         return [TextContent(type="text", text=json.dumps(words, ensure_ascii=False))]
-    
+
     elif name == "read_output_file":
-        step_str = arguments.get("step", "")
-        
-        # Convert string step to int
+        step_str = str(arguments.get("step", ""))
         try:
             step = int(step_str)
         except (ValueError, TypeError):
-            return [TextContent(type="text", text=f"ERROR: Invalid step '{step_str}'. Must be '1', '2', or '3'")]
-        
+            return [TextContent(type="text", text=f"ERROR: Invalid step '{step_str}'. Must be '1', '2', or '3'.")]
         if step == 1:
             filepath = factory.section_a_path
         elif step == 2:
@@ -724,55 +715,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif step == 3:
             filepath = factory.section_c_path
         else:
-            return [TextContent(type="text", text=f"ERROR: Invalid step {step}. Must be 1, 2, or 3")]
-        
+            return [TextContent(type="text", text=f"ERROR: Invalid step {step}. Must be 1, 2, or 3.")]
         if not os.path.exists(filepath):
             return [TextContent(type="text", text=f"File not found (empty): {os.path.basename(filepath)}")]
-        
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-        
         if not content.strip():
             return [TextContent(type="text", text=f"File is empty: {os.path.basename(filepath)}")]
-        
         return [TextContent(type="text", text=content)]
-    
-    elif name == "prepare_parallel_step1":
-        batch_size = arguments.get("batch_size")
-        worker_count = arguments.get("worker_count")
-
-        if batch_size is not None and batch_size < 1:
-            return [TextContent(type="text", text="ERROR: batch_size must be >= 1")]
-        if worker_count is not None and worker_count < 1:
-            return [TextContent(type="text", text="ERROR: worker_count must be >= 1")]
-
-        try:
-            batches = factory.prepare_parallel_batches(
-                worker_count=worker_count,
-                batch_size=batch_size,
-            )
-        except RuntimeError as e:
-            return [TextContent(type="text", text=f"ERROR: {e}")]
-
-        if not batches:
-            return [TextContent(type="text", text="Step 1 already complete. Call run_delusionist to advance.")]
-
-        result = {
-            "total_workers": len(batches),
-            "total_lines": sum(b["line_count"] for b in batches),
-            "workers": batches,
-        }
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
     elif name == "prepare_parallel_gemini_workers":
         batch_size = arguments.get("batch_size")
         worker_count = arguments.get("worker_count")
-
         if batch_size is not None and batch_size < 1:
             return [TextContent(type="text", text="ERROR: batch_size must be >= 1")]
         if worker_count is not None and worker_count < 1:
             return [TextContent(type="text", text="ERROR: worker_count must be >= 1")]
-
         try:
             workers = factory.prepare_parallel_gemini_workers(
                 worker_count=worker_count,
@@ -780,11 +738,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             )
         except RuntimeError as e:
             return [TextContent(type="text", text=f"ERROR: {e}")]
-
         if not workers:
             return [TextContent(type="text", text="Step 1 already complete. Call run_delusionist to advance.")]
-
         result = {
+            "agent_id": aid,
             "total_workers": len(workers),
             "total_lines": sum(w["line_count"] for w in workers),
             "workers": workers,
@@ -800,11 +757,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         chains_count = int(arguments.get("chains_count", 0))
         if chains_count < 1:
             return [TextContent(type="text", text="ERROR: chains_count must be >= 1")]
-
         direction = str(arguments.get("direction", "")).strip()
         if not direction:
             return [TextContent(type="text", text="ERROR: direction is required")]
-
         starting = str(arguments.get("starting", ""))
         mandatory = list(arguments.get("mandatory") or [])
         imagery = list(arguments.get("imagery") or [])
@@ -833,8 +788,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             final_language=final_language,
         )
 
-        from pathlib import Path
-        mini_staging = Path(factory.base_dir) / "mini" / "staging"
+        mini_staging = _mini_staging_dir(aid)
         try:
             workers = split_step1_workers(
                 cfg=cfg,
@@ -863,6 +817,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             workers_out.append(item)
 
         result = {
+            "agent_id": aid,
             "executor": executor,
             "final_language": final_language,
             "total_workers": len(workers),
@@ -880,11 +835,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         chains = list(arguments.get("chains") or [])
         if not chains:
             return [TextContent(type="text", text="ERROR: chains must be a non-empty list")]
-
         direction = str(arguments.get("direction", "")).strip()
         if not direction:
             return [TextContent(type="text", text="ERROR: direction is required")]
-
         mandatory = list(arguments.get("mandatory") or [])
         final_language_in = str(arguments.get("final_language", "Auto"))
         executor = str(arguments.get("executor", "GEMINI")).upper()
@@ -910,8 +863,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             final_language=final_language,
         )
 
-        from pathlib import Path
-        mini_staging = Path(factory.base_dir) / "mini" / "staging"
+        mini_staging = _mini_staging_dir(aid)
         try:
             workers = split_step1_1_workers(
                 cfg=cfg,
@@ -940,6 +892,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             workers_out.append(item)
 
         result = {
+            "agent_id": aid,
             "executor": executor,
             "final_language": final_language,
             "total_workers": len(workers),
@@ -948,30 +901,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         }
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
-    elif name == "parse_mini_step1_response":
-        try:
-            from mini.core import parse_step1_response
-        except ImportError as e:
-            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
-        raw = str(arguments.get("raw", ""))
-        lines = parse_step1_response(raw)
-        return [TextContent(type="text", text=json.dumps(lines, ensure_ascii=False))]
-
-    elif name == "parse_mini_step1_1_response":
-        try:
-            from mini.core import parse_step1_1_response
-        except ImportError as e:
-            return [TextContent(type="text", text=f"ERROR: mini module not importable: {e}")]
-        raw = str(arguments.get("raw", ""))
-        lines = parse_step1_1_response(raw)
-        return [TextContent(type="text", text=json.dumps(lines, ensure_ascii=False))]
-
-    else:
-        return [TextContent(type="text", text=f"ERROR: Unknown tool '{name}'")]
+    return [TextContent(type="text", text=f"ERROR: Unknown tool '{name}'")]
 
 
 async def main():
-    """Run MCP server."""
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
